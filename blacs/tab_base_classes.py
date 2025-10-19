@@ -35,15 +35,20 @@ import qtutils.icons
 from labscript_utils.qtwidgets.elide_label import elide_label
 from labscript_utils.ls_zprocess import ProcessTree, RemoteProcessClient
 from labscript_utils.shared_drive import path_to_local
-from blacs import BLACS_DIR
+try:
+    from blacs import BLACS_DIR
+except ImportError:
+    from blacs.blacs import BLACS_DIR
 
 process_tree = ProcessTree.instance()
 from labscript_utils import dedent
 
 
 class Counter(object):
-    """A class with a single method that 
-    returns a different integer each time it's called."""
+    """
+    A class with a single method that returns 
+    a different integer each time it's called.
+    """
     def __init__(self):
         self.i = 0
     def get(self):
@@ -55,21 +60,10 @@ MODE_MANUAL = 1
 MODE_TRANSITION_TO_BUFFERED = 2
 MODE_TRANSITION_TO_MANUAL = 4
 MODE_BUFFERED = 8  
+MODE_TRANSITION_TO_POST_EXP = 16
+MODE_POST_EXP = 32
             
 class StateQueue(object):
-    # NOTE:
-    #
-    # It is theoretically possible to remove the dependency on the Qt Mainloop (remove inmain decorators and fnuction calls)
-    # by introducing a local lock object instead. However, be aware that right now, the Qt inmain lock is preventing the 
-    # statemachine loop (Tab.mainloop) from getting any states uot of the queue until after the entire tab is initialised 
-    # and the Qt mainloop starts.
-    #
-    # This is particularly important because we exploit this behaviour to make sure that Tab._initialise_worker is placed at the
-    # start of the StateQueue, and so the Tab.mainloop method is guaranteed to get this initialisation method as the first state 
-    # regardless of whether the mainloop is started before the state is inserted (the state should always be inserted as part of  
-    # the call to Tab.create_worker, in DeviceTab.initialise_workers in DeviceTab.__init__ )
-    #
-    
     def __init__(self,device_name):
         self.logger = logging.getLogger('BLACS.%s.state_queue'%(device_name))
         self.logging_enabled = False
@@ -78,59 +72,62 @@ class StateQueue(object):
         
         self.list_of_states = []
         self._last_requested_state = None
-        # A queue that blocks the get(requested_state) method until an entry in the queue has a state that matches the requested_state
-        self.get_blocking_queue = queue.Queue()
+
+        # locks and condition variables to implement thread-safe Single-Consumer Multi-Producer StateQueue operations
+        self._queue_lock = threading.Lock()
+        self._state_requested = threading.Condition(self._queue_lock)
+        self._state_added = threading.Condition(self._queue_lock)
+        self.qt_mainloop_instantiated = False
+
+    # A function that must run on the QT MainThread. This function is called in the DeviceTab.mainloop to 
+    # suspends any operations until the MainThread has been instantiated
+    @inmain_decorator(True)
+    def queue_inmain(self):
+        self.qt_mainloop_instantiated = True
 
     @property
-    @inmain_decorator(True)    
-    # This is always done in main so that we avoid a race condition between the get method and
-    # the put method accessing this property
     def last_requested_state(self):
         return self._last_requested_state
-    
+
     @last_requested_state.setter
-    @inmain_decorator(True)
     def last_requested_state(self, value):
         self._last_requested_state = value
      
     def log_current_states(self):
         if self.logging_enabled:
             self.logger.debug('Current items in the state queue: %s'%str(self.list_of_states))
-     
-    # this should only happen in the main thread, as my implementation is not thread safe!
-    @inmain_decorator(True)   
-    def put(self, allowed_states, queue_state_indefinitely, delete_stale_states, data, priority=0):
-        """Add a state to the queue. Lower number for priority indicates the state will
-        be executed before any states with higher numbers for their priority"""
-        # State data starts with priority, and then with a unique id that monotonically
-        # increases. This way, sorting the queue will sort first by priority and then by
-        # order added.
-        state_data = [priority, get_unique_id(), allowed_states, queue_state_indefinitely, delete_stale_states,data]
-        # Insert the task into the queue, retaining sort order first by priority and then by order added:
-        insort(self.list_of_states, state_data)
-        # if this state is one the get command is waiting for, notify it!
-        if self.last_requested_state is not None and allowed_states&self.last_requested_state:
-            self.get_blocking_queue.put('new item')
-        
-        if self.logging_enabled:
-            if not isinstance(data[0],str):
-                self.logger.debug('New state queued up. Allowed modes: %d, queue state indefinitely: %s, delete stale states: %s, function: %s'%(allowed_states,str(queue_state_indefinitely),str(delete_stale_states),data[0].__name__))
-        self.log_current_states()
     
-    # this should only happen in the main thread, as my implementation is not thread safe!
-    @inmain_decorator(True)
-    def check_for_next_item(self,state):
-        # We reset the queue here, as we are about to traverse the tree, which contains any new items that
-        # are described in messages in this queue, so let's not keep those messages around anymore.
-        # Put another way, we want to block until a new item is added, if we don't find an item in this function
-        # So it's best if the queue is empty now!
-        if self.logging_enabled:
-            self.logger.debug('Re-initialsing self._get_blocking_queue')
-        self.get_blocking_queue = queue.Queue()
+    # Multiple threads (producers) can now add to the StateQueue.
+    # To ensure thread-safety, the lock wraps the entire function, allowing only one thread to add a state to the queue at a time.
+    # Once the requested state is added, the consumer function (get) is notified to process and execute the state function.
+    def put(self, allowed_states, queue_state_indefinitely, delete_stale_states, data, priority=0):
+        """
+        Add a state to the queue. Lower number for priority indicates the state will
+        be executed before any states with higher numbers for their priority
+        """
+        with self._state_added:
+            # State data is sorted into the queue first by priority and then by order added.
+            state_data = [priority, get_unique_id(), allowed_states, queue_state_indefinitely, delete_stale_states,data]
+            # Insert the task into the queue, retaining sort order first by priority and then by order added:
+            insort(self.list_of_states, state_data)
+            
+            # log the addition of the new state, if necessary
+            if self.logging_enabled:
+                if not isinstance(data[0],str):
+                    self.logger.debug('New state queued up. Allowed modes: %d, queue state indefinitely: %s, delete stale states: %s, function: %s'%(allowed_states,str(queue_state_indefinitely),str(delete_stale_states),data[0].__name__))
+            self.log_current_states()
 
+            # if this state is one the consumer (get) is waiting for, notify it!
+            if self.last_requested_state is not None and (allowed_states & self.last_requested_state):
+                self._state_requested.notify()
+    
+    # The caller function StateQueue::get() manages the thread-safety of this function.
+    # The locking scheme also serializes the get and put methods, ensuring that shared resources like self.list_of_states remain synchronized.
+    def check_for_next_item(self,state):
         # traverse the list
         delete_index_list = []
         success = False
+
         for i,item in enumerate(self.list_of_states):
             priority, unique_id, allowed_states, queue_state_indefinitely, delete_stale_states, data = item
             if self.logging_enabled:
@@ -172,27 +169,27 @@ class StateQueue(object):
             data = None
         return success,data    
         
-    # this method should not be called in the main thread, because it will block until something is found...
-    # Please, only have one thread ever accessing this...I have no idea how it will behave if multiple threads are trying to get
-    # items from the queue...
-    #
-    # This method will block until a item found in the queue is found to be allowed during the specified 'state'.
+    # Each DeviceTab StateQueue object has a single consumer, the DeviceTab.mainloop thread.
+    # Execution of this function in the mainloop is thread-safe, as synchronization with the producer function is managed
+    # through the acquisition of self._queue_lock.
     def get(self,state):
-        if self.last_requested_state:
-            raise Exception('You have multiple threads trying to get from this queue at the same time. I won\'t allow it!')
-    
-        self.last_requested_state = state
-        while True:
-            if self.logging_enabled:
-                self.logger.debug('requesting next item in queue with mode %d'%state)
-                inmain(self.log_current_states)
-            status,data = self.check_for_next_item(state)
-            if not status:
-                # we didn't find anything useful, so we'll wait until a useful state is added!
-                self.get_blocking_queue.get()
-            else:
-                self.last_requested_state = None
-                return data
+        with self._state_requested:
+            if self.last_requested_state:
+                raise Exception('You have multiple threads trying to get from this queue at the same time. I won\'t allow it!')
+        
+            self.last_requested_state = state
+            while True:
+                if self.logging_enabled:
+                    self.logger.debug('requesting next item in queue with mode %d'%state)
+                    self.log_current_states
+                status,data = self.check_for_next_item(state)
+                if not status:
+                    # wait and release lock here if the requested state is not in the queue
+                    # while we wait for the requested state to be added
+                    self._state_requested.wait()
+                else:
+                    self.last_requested_state = None
+                    return data
 
 
 # A counter for uniqely numbering timeouts and numbering queued states monotinically,
@@ -203,7 +200,7 @@ def define_state(allowed_modes,queue_state_indefinitely,delete_stale_states=Fals
     def wrap(function):
         unescaped_name = function.__name__
         escapedname = '_' + function.__name__
-        if allowed_modes < 1 or allowed_modes > 15:
+        if allowed_modes < 1 or allowed_modes > 63:
             raise RuntimeError('Function %s has been set to run in unknown states. Please make sure allowed states is one or more of MODE_MANUAL,'%unescaped_name+
             'MODE_TRANSITION_TO_BUFFERED, MODE_TRANSITION_TO_MANUAL and MODE_BUFFERED (or-ed together using the | symbol, eg MODE_MANUAL|MODE_BUFFERED')
         def f(self,*args,**kwargs):
@@ -252,6 +249,7 @@ class Tab(object):
         self._force_full_buffered_reprogram = True
         self.event_queue = StateQueue(self.device_name)
         self.workers = {}
+        self.worker_classes = [] # used to check existence of 'post_experiment' method in device worers
         self._supports_smart_programming = False
         self._restart_receiver = []
         self.shutdown_workers_complete = False
@@ -266,7 +264,8 @@ class Tab(object):
         self._changed_widget = self._ui.changed_widget
         self._changed_layout = self._ui.changed_layout
         self._changed_widget.hide()        
-        
+        self._changed_widget_set = False
+
         conn_str = self.BLACS_connection
         if self.remote_process_client is not None:
             conn_str += " via %s:%d" % (self.remote_process_client.host, self.remote_process_client.port)
@@ -305,7 +304,9 @@ class Tab(object):
         self._timeout = QTimer()
         self._timeout.timeout.connect(self.check_time)
         self._timeout.start(1000)
-                
+        
+        self.qt_mainloop_instantiated = False
+
         # Launch the mainloop
         self._mainloop_thread = threading.Thread(target = self.mainloop)
         self._mainloop_thread.daemon = True
@@ -378,7 +379,8 @@ class Tab(object):
     @force_full_buffered_reprogram.setter
     def force_full_buffered_reprogram(self,value):
         self._force_full_buffered_reprogram = bool(value)
-        self._ui.button_clear_smart_programming.setEnabled(not bool(value))
+        with qtlock:
+            self._ui.button_clear_smart_programming.setEnabled(not bool(value))
     
     @property
     @inmain_decorator(True)
@@ -450,7 +452,7 @@ class Tab(object):
     @mode.setter
     def mode(self,mode):
         self._mode = mode
-        self._update_state_label()
+        # self._update_state_label()
         
     @property
     def state(self):
@@ -460,25 +462,30 @@ class Tab(object):
     def state(self,state):
         self._state = state        
         self._time_of_last_state_change = time.time()
-        self._update_state_label()
+        # self._update_state_label()
         self._update_error_and_tab_icon()
     
-    @inmain_decorator(True)
+    # TODO: Make decision to remove entirely as the GUI updates dont give much 
+    # useful information
+    # @inmain_decorator(True)
     def _update_state_label(self):
-        if self.mode == 1:
-            mode = 'Manual'
-        elif self.mode == 2:
-            mode = 'Transitioning to buffered'
-        elif self.mode == 4:
-            mode = 'Transitioning to manual'
-        elif self.mode == 8:
-            mode = 'Buffered'
-        else:
-            raise RuntimeError('self.mode for device %s is invalid. It must be one of MODE_MANUAL, MODE_TRANSITION_TO_BUFFERED, MODE_TRANSITION_TO_MANUAL or MODE_BUFFERED'%(self.device_name))
+        pass
+        # if self.mode == 1:
+        #     mode = 'Manual'
+        # elif self.mode == 2:
+        #     mode = 'Transitioning to buffered'
+        # elif self.mode == 4:
+        #     mode = 'Transitioning to manual'
+        # elif self.mode == 8:
+        #     mode = 'Buffered'
+        # elif self.mode == 16:
+        #     mode = 'Transitioning to post_experiment'
+        # elif self.mode == 32:
+        #     mode = 'Post_experiment'
+        # else:
+        #     raise RuntimeError('self.mode for device %s is invalid. It must be one of MODE_MANUAL, MODE_TRANSITION_TO_BUFFERED, MODE_TRANSITION_TO_MANUAL or MODE_BUFFERED'%(self.device_name))
     
-        self._ui.state_label.setText('<b>%s mode</b> - State: %s'%(mode,self.state))
-        
-        # Todo: Update icon in tab
+        # self._ui.state_label.setText('<b>%s mode</b> - State: %s'%(mode,self.state))
     
     def create_worker(self,name,WorkerClass,workerargs=None):
         """Set up a worker process. WorkerClass can either be a subclass of Worker, or a
@@ -514,6 +521,7 @@ class Tab(object):
                 remote_process_client=self.remote_process_client,
                 startup_timeout=30
                 )
+            self.worker_classes.append(WorkerClass)
         elif isinstance(WorkerClass, str):
             # If we were passed a string for the WorkerClass, it is an import path
             # for where the Worker class can be found. Pass it to zprocess.Process,
@@ -525,19 +533,22 @@ class Tab(object):
                 startup_timeout=30,
                 subclass_fullname=WorkerClass
             )
+            self.worker_classes.append(WorkerClass)
         else:
             raise TypeError(WorkerClass)
         self.workers[name] = (worker,None,None)
-        self.event_queue.put(MODE_MANUAL|MODE_BUFFERED|MODE_TRANSITION_TO_BUFFERED|MODE_TRANSITION_TO_MANUAL,True,False,[Tab._initialise_worker,[(name, workerargs),{}]], priority=-1)
+        self.event_queue.put(MODE_MANUAL|MODE_BUFFERED|MODE_TRANSITION_TO_BUFFERED|MODE_TRANSITION_TO_MANUAL|MODE_POST_EXP|MODE_TRANSITION_TO_POST_EXP,True,False,[Tab._initialise_worker,[(name, workerargs),{}]], priority=-1)
        
     def _initialise_worker(self, worker_name, workerargs):
-        yield (self.queue_work(worker_name, 'init', worker_name, self.device_name, workerargs))
+        tasks = []
+        tasks.append(self.queue_work(worker_name, 'init', worker_name, self.device_name, workerargs))
+        yield(tasks, False)
         if self.error_message:
             raise Exception('Device failed to initialise')
                
-    @define_state(MODE_MANUAL|MODE_BUFFERED|MODE_TRANSITION_TO_BUFFERED|MODE_TRANSITION_TO_MANUAL,True)  
+    @define_state(MODE_MANUAL|MODE_BUFFERED|MODE_TRANSITION_TO_BUFFERED|MODE_TRANSITION_TO_MANUAL|MODE_POST_EXP|MODE_TRANSITION_TO_POST_EXP,True)  
     def _timeout_add(self,delay,execute_timeout):
-        QTimer.singleShot(delay,execute_timeout)
+        inmain(QTimer.singleShot, delay,execute_timeout)
     
     def statemachine_timeout_add(self,delay,statefunction,*args,**kwargs):
         # Add the timeout to our set of registered timeouts. Timeouts
@@ -555,6 +566,7 @@ class Tab(object):
                     statefunction(*args, **kwargs)
                 # queue up another call to this function (execute_timeout)
                 # after the delay time:
+
                 self._timeout_add(delay,execute_timeout)
             
         # Store a unique ID for this timeout so that we don't confuse 
@@ -563,7 +575,7 @@ class Tab(object):
         unique_id = get_unique_id()
         self._timeout_ids[statefunction] = unique_id
         # queue the first run:
-        #QTimer.singleShot(delay,execute_timeout)    
+        #QTimer.singleShot(delay,execute_timeout)   
         execute_timeout()
         
     # Returns True if the timeout was removed
@@ -584,11 +596,13 @@ class Tab(object):
             self._timeouts = set()
             return False        
     
-    @define_state(MODE_MANUAL|MODE_BUFFERED|MODE_TRANSITION_TO_BUFFERED|MODE_TRANSITION_TO_MANUAL,True)
+    @define_state(MODE_MANUAL|MODE_BUFFERED|MODE_TRANSITION_TO_BUFFERED|MODE_TRANSITION_TO_MANUAL|MODE_POST_EXP|MODE_TRANSITION_TO_POST_EXP,True)
     def shutdown_workers(self):
         """Ask all workers to shutdown"""
+        tasks = []
         for worker_name in self.workers:
-            yield(self.queue_work(worker_name, 'shutdown'))
+            tasks.append(self.queue_work(worker_name, 'shutdown'))
+        yield(tasks, False)
         self.shutdown_workers_complete = True
 
     def close_tab(self, finalise=True):
@@ -609,7 +623,7 @@ class Tab(object):
         # In case the mainloop is blocking on the event queue, post a message to that
         # queue telling it to quit:
         if self._mainloop_thread.is_alive():
-            self.event_queue.put(MODE_MANUAL|MODE_BUFFERED|MODE_TRANSITION_TO_BUFFERED|MODE_TRANSITION_TO_MANUAL,True,False,['_quit',None],priority=-1)
+            self.event_queue.put(MODE_MANUAL|MODE_BUFFERED|MODE_TRANSITION_TO_BUFFERED|MODE_TRANSITION_TO_MANUAL|MODE_POST_EXP|MODE_TRANSITION_TO_POST_EXP,True,False,['_quit',None],priority=-1)
         self.notebook = self._ui.parentWidget().parentWidget()
         currentpage = None
         if self.notebook:
@@ -767,6 +781,12 @@ class Tab(object):
         
         try:
             while True:
+                # Statemachine loop (Tab.mainloop) should not get any states out of the queue until after the entire tab is initialised 
+                # and the Qt mainloop starts.
+                if not self.qt_mainloop_instantiated:
+                    logger.debug('Waiting for QT mainloop to be instantiated')
+                    event_queue.queue_inmain()
+                    self.qt_mainloop_instantiated = True
                 # Get the next task from the event queue:
                 logger.debug('Waiting for next event')
                 func, data = event_queue.get(self.mode)
@@ -777,69 +797,113 @@ class Tab(object):
                 args,kwargs = data
                 logger.debug('Processing event %s' % func.__name__)
                 self.state = '%s (GUI)'%func.__name__
-                # Run the task with the GUI lock, catching any exceptions:
-                #func = getattr(self,funcname)
-                # run the function in the Qt main thread
-                generator = inmain(func,self,*args,**kwargs)
-                # Do any work that was queued up:(we only talk to the worker if work has been queued up through the yield command)
+                generator = func(self, *args, **kwargs)
+                # Process any work that was queued up:
+                # We only communicate with the worker if work has been queued up through the yield command.
+                # 
+                # The new API expects the yield command to pass along the work for all workers. As such, the yield command should queue
+                # up the following tuple: (worker_tasks, check_main_first).
+                #
+                # Args:
+                #   worker_tasks (list): A list of worker tasks, each involving worker_process, worker_function, worker_args, and worker_kwargs
+                #                        as before.
+                #   check_main_first (bool): If True, the main worker must be successful before processing all other workers. If it is
+                #                            not, we exit without checking the status of secondary workers.
+                #
+                # Returns:
+                #   results_send_list (list): A list of the results that were returned by the workers. The state function implementations have been modified
+                #                      to unpack the results appropriately.
+                # 
+                # Ensure backwards compatibility:
+                # If we don't receive the aforementioned ([list], bool) tuple, we can fall back to accepting yield commands from State Functions that
+                # queue up a single worker at a time. If this is the case, we also fall back to passing the results from the worker one at a time.
                 if type(generator) == GeneratorType:
-                    # We need to call next recursively, queue up work and send the results back until we get a StopIteration exception
                     generator_running = True
-                    # get the data from the first yield function
-                    worker_process,worker_function,worker_args,worker_kwargs = inmain(generator.__next__)
-                    # Continue until we get a StopIteration exception, or the user requests a restart
+                    check_main_first = False
+                    old_worker_flow = False
+                    active_workers = []
+                    results_send_list = []
+                    queued_work = generator.__next__()
+                    # Check format of yield command:
+                    if queued_work == None:
+                        # Support for backwards compatibility, do not process generator
+                        generator_running = False    
+                    elif isinstance(queued_work[0], list) and len(queued_work) == 2:
+                        worker_tasks, check_main_first = queued_work
+                    elif isinstance(queued_work, tuple):
+                        old_worker_flow = True
+                        worker_tasks = [queued_work]
+                    else:
+                        raise Exception("""Invalid yield command: Expected a tuple ([worker_tasks], check_main_first) 
+                                        for the new API or a single worker task for the old API.""")
                     while generator_running:
                         try:
-                            logger.debug('Instructing worker %s to do job %s'%(worker_process,worker_function) )
-                            if worker_function == 'init':
-                                # Start the worker process before running its init() method:
-                                self.state = '%s (%s)'%('Starting worker process', worker_process)
-                                worker, _, _ = self.workers[worker_process]
-                                to_worker, from_worker = worker.start(*worker_args)
-                                self.workers[worker_process] = (worker, to_worker, from_worker)
-                                worker_args = ()
-                                del worker # Do not gold a reference indefinitely
-                            worker_arg_list = (worker_function,worker_args,worker_kwargs)
-                            # This line is to catch if you try to pass unpickleable objects.
-                            try:
-                                pickle.dumps(worker_arg_list)
-                            except Exception:
-                                self.error_message += 'Attempt to pass unserialisable object to child process:'
-                                raise
-                            # Send the command to the worker
-                            to_worker = workers[worker_process][1]
-                            from_worker = workers[worker_process][2]
-                            to_worker.put(worker_arg_list)
-                            self.state = '%s (%s)'%(worker_function,worker_process)
-                            # Confirm that the worker got the message:
-                            logger.debug('Waiting for worker to acknowledge job request')
-                            success, message, results = from_worker.get()
-                            if not success:
-                                logger.info('Worker reported failure to start job')
-                                raise Exception(message)
-                            # Wait for and get the results of the work:
-                            logger.debug('Worker reported job started, waiting for completion')
-                            success,message,results = from_worker.get()
-                            if not success:
-                                logger.info('Worker reported exception during job')
-                                now = time.strftime('%a %b %d, %H:%M:%S ',time.localtime())
-                                self.error_message += ('Exception in worker - %s:<br />' % now +
-                                               '<FONT COLOR=\'#ff0000\'>%s</FONT><br />'%escape(message).replace(' ','&nbsp;').replace('\n','<br />'))
-                            else:
-                                logger.debug('Job completed')
-                            
+                            for worker_task in worker_tasks:
+                                worker_process,worker_function,worker_args,worker_kwargs = worker_task
+                                logger.debug('Instructing worker %s to do job %s'%(worker_process,worker_function) )
+                                if worker_function == 'init':
+                                    # Start the worker process before running its init() method:
+                                    self.state = '%s (%s)'%('Starting worker process', worker_process)
+                                    worker, _, _ = self.workers[worker_process]
+                                    to_worker, from_worker = worker.start(*worker_args)
+                                    self.workers[worker_process] = (worker, to_worker, from_worker)
+                                    worker_args = ()
+                                    del worker # Do not gold a reference indefinitely
+                                worker_arg_list = (worker_function,worker_args,worker_kwargs)
+                                # This line is to catch if you try to pass unpickleable objects.
+                                try:
+                                    pickle.dumps(worker_arg_list)
+                                except Exception:
+                                    self.error_message += 'Attempt to pass unserialisable object to child process:'
+                                    raise
+                                # Send the command to the worker
+                                to_worker = workers[worker_process][1]
+                                from_worker = workers[worker_process][2]
+                                to_worker.put(worker_arg_list)
+                                self.state = '%s (%s)'%(worker_function,worker_process)
+                                
+                                logger.debug('Waiting for worker to acknowledge job request')
+                                success, message, results = from_worker.get()
+                                if not success:
+                                    logger.info('Worker reported failure to start job')
+                                    raise Exception(message)
+                                logger.debug('Worker reported job started, waiting for completion')
+
+                                active_workers.append((worker_process, from_worker))
+
+                            for worker_process, from_worker in active_workers:
+                                success, message, results = from_worker.get()
+                                if not success:
+                                    logger.info('Worker reported exception during job')
+                                    now = time.strftime('%a %b %d, %H:%M:%S ',time.localtime())
+                                    self.error_message += ('Exception in worker - %s:<br />' % now +
+                                                    '<FONT COLOR=\'#ff0000\'>%s</FONT><br />'%escape(message).replace(' ','&nbsp;').replace('\n','<br />'))
+                                else:
+                                    logger.debug(f'Job completed {worker_process}')
+                                
+                                # Prepare to send the results back to the GUI function
+                                results_send_list.append(results)
+                                if (worker_process == "main_worker" and check_main_first) and (results == False or results == None):
+                                    # Do not process the other worker events, just send back the faulty state
+                                    break
+
                             # Reset the hide_not_responding_error_until, since we have now heard from the child                        
                             self.hide_not_responding_error_until = 0
-                                
+
                             # Send the results back to the GUI function
                             logger.debug('returning worker results to function %s' % func.__name__)
                             self.state = '%s (GUI)'%func.__name__
-                            next_yield = inmain(generator.send,results) 
-                            # If there is another yield command, put the data in the required variables for the next loop iteration
+                            
+                            if old_worker_flow:
+                                next_yield = generator.send(results_send_list[0])
+                            else:
+                                next_yield = generator.send(results_send_list)
+
                             if next_yield:
-                                worker_process,worker_function,worker_args,worker_kwargs = next_yield
+                                assert old_worker_flow, "should only recieve a second yield in the old worker flow that queues up workers serially"
+                                worker_tasks = [next_yield]
                         except StopIteration:
-                            # The generator has finished. Ignore the error, but stop the loop
+                            # The generator has finished. Stop the loop
                             logger.debug('Finalising function')
                             generator_running = False
                 self.state = 'idle'
