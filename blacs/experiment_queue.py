@@ -507,6 +507,11 @@ class QueueManager(object):
        
      
     def manage(self):
+        #If you want to comment profile to run faster, comment below
+        # import cProfile
+        # prof = cProfile.Profile()
+        # prof.enable()
+        #Comment above
         logger = logging.getLogger('BLACS.queue_manager.thread')  
         process_tree.zlock_client.set_thread_name('queue_manager') 
         # While the program is running!
@@ -1051,3 +1056,7 @@ class QueueManager(object):
 
             # self.set_status("Idle")
         logger.info('Stopping')
+        #Comment Below
+        # prof.disable()
+        # prof.dump_stats('C:/Users/labadmin/labscript-suite/blacs/manage_profile.prof')
+        #Comment Above
