@@ -405,13 +405,29 @@ class QueueManager(object):
             self._model.insertRow(0,QStandardItem(h5file))
         self._queue_not_empty.set()
     
-    def process_request(self,h5_filepath):
+    def process_request(self,h5_filepath,skip_connection_check=False):
         # check connection table
-        try:
-            new_conn = ConnectionTable(h5_filepath, logging_prefix='BLACS')
-        except Exception:
-            return "H5 file not accessible to Control PC\n"
-        result,error = inmain(self.BLACS.connection_table.compare_to,new_conn)
+        #
+        # skip_connection_check is set by the "Repeat" resubmission call at the end of
+        # manage() (unlike external submissions, that call runs synchronously on
+        # manage()'s own thread, so its cost is fully exposed as part of the
+        # shot-to-shot gap rather than being pipelined away on a separate thread).
+        # It's safe to skip here: the file we're about to resubmit is the exact one
+        # that just finished running, so it was already validated against this exact
+        # (unchanging, for the life of this BLACS session) connection table moments
+        # ago.
+        if skip_connection_check:
+            result, error = True, None
+        else:
+            _ct_start = time.time()
+            try:
+                new_conn = ConnectionTable(h5_filepath, logging_prefix='BLACS')
+            except Exception:
+                return "H5 file not accessible to Control PC\n"
+            result,error = inmain(self.BLACS.connection_table.compare_to,new_conn)
+            self._logger.debug(
+                'process_request connection table check took %.3fs' % (time.time() - _ct_start)
+            )
         if result:
             # Has this run file been run already?
             with h5py.File(h5_filepath, 'r') as h5_file:
@@ -425,7 +441,11 @@ class QueueManager(object):
                 # Keep counting up until we get a filename that isn't in the filesystem:
                 while os.path.exists(new_h5_filepath):
                     new_h5_filepath, repeat_number = self.new_rep_name(new_h5_filepath)
+                _copy_start = time.time()
                 success = self.clean_h5_file(h5_filepath, new_h5_filepath, repeat_number=repeat_number)
+                self._logger.debug(
+                    'process_request clean_h5_file copy took %.3fs' % (time.time() - _copy_start)
+                )
                 if not success:
                    return 'Cannot create a re run of this experiment. Is it a valid run file?'
                 self.append([new_h5_filepath])
@@ -1190,7 +1210,7 @@ class QueueManager(object):
                     (self.manager_repeat_mode == self.REPEAT_LAST and inmain(self._model.rowCount) == 0)):
                     # Resubmit job to the bottom of the queue:
                     try:
-                        message = self.process_request(path)
+                        message = self.process_request(path, skip_connection_check=True)
                     except Exception:
                         # TODO: make this error popup for the user
                         self._logger.exception('Failed to copy h5_file (%s) for repeat run'%s)
