@@ -116,6 +116,21 @@ class QueueManager(object):
         
         self._logger = logging.getLogger('BLACS.QueueManager')   
         
+        # Set when a shot is appended/prepended to the queue, so the manager
+        # thread can wake immediately instead of polling on a fixed timer
+        # when the queue is empty.
+        self._queue_not_empty = threading.Event()
+
+        # Opt-in optimization: when True, assume every shot in a continuously
+        # queued run uses the same device list/start_order/stop_order as the
+        # previous shot, and skip re-opening the h5 file to look it up
+        # (which costs ~40-60ms/shot depending on shot length). Only safe if
+        # your queued sequences never mix scripts/connection-table subsets
+        # that use a different set of devices. The cache is invalidated
+        # whenever the queue runs dry, so a fresh run always re-verifies.
+        self.assume_static_shot_devices = False
+        self._cached_shot_devices = None
+
         # Create listview model
         self._model = QStandardItemModel()
         self._create_headers()
@@ -368,11 +383,13 @@ class QueueManager(object):
             item = QStandardItem(file)
             item.setToolTip(file)
             self._model.appendRow(item)
-    
+        self._queue_not_empty.set()
+
     @inmain_decorator(True)
     def prepend(self,h5file):
         if not self.is_in_queue(h5file):
             self._model.insertRow(0,QStandardItem(h5file))
+        self._queue_not_empty.set()
     
     def process_request(self,h5_filepath):
         # check connection table
@@ -589,9 +606,29 @@ class QueueManager(object):
                 self.set_status('Preparing shot...', path)
                 logger.info('Got a file: %s'%path)
             except Exception:
-                # If no files, sleep for 1s,
+                # No files in the queue. Wait to be woken by append()/prepend()
+                # instead of polling on a fixed timer, so a shot submitted right
+                # after this check is picked up immediately rather than after
+                # up to 1s of latency. The clear-then-check-then-wait ordering
+                # avoids missing a wakeup that occurs between the two calls.
                 self.set_status("Idle")
-                time.sleep(1)
+                self._queue_not_empty.clear()
+                # The queue just ran dry: invalidate the cached device list so
+                # the next run (which may use a different script/device set)
+                # re-reads it from the shot's h5 file rather than trusting a
+                # stale cache from the previous run.
+                self._cached_shot_devices = None
+                # Default to True (i.e. don't wait) if has_next_file() itself
+                # raises, matching the same defensive pattern used elsewhere
+                # in this file (see the queued_experiments check below) rather
+                # than letting an exception here kill the manager thread.
+                queue_has_file = True
+                try:
+                    queue_has_file = self.has_next_file()
+                except Exception:
+                    pass
+                if not queue_has_file:
+                    self._queue_not_empty.wait(1)
                 continue
             
             devices_in_use = {}
@@ -640,20 +677,28 @@ class QueueManager(object):
                         logger.exception("Plugin callback raised an exception")
 
                 start_time = time.time()
-                
-                # TODO:OPT: opening this h5 file causes a 40-60ms delay depending on your shot length. 
-                # See blacs/performance_hacks for how to get around this.
-                with h5py.File(path, 'r') as hdf5_file:
-                    devices_in_use = {}
-                    start_order = {}
-                    stop_order = {}
-                    for name in  hdf5_file['devices']:
-                        device_properties = labscript_utils.properties.get(
-                            hdf5_file, name, 'device_properties'
-                        )
-                        devices_in_use[name] = self.BLACS.tablist[name]
-                        start_order[name] = device_properties.get('start_order', None)
-                        stop_order[name] = device_properties.get('stop_order', None)
+
+                # Opening this h5 file just to read the device list/ordering costs
+                # ~40-60ms depending on shot length. If assume_static_shot_devices is
+                # enabled, reuse the result from the previous shot in this run instead
+                # of re-reading it (the cache is invalidated whenever the queue goes
+                # idle, so a fresh run always re-verifies on its first shot).
+                if self.assume_static_shot_devices and self._cached_shot_devices is not None:
+                    devices_in_use, start_order, stop_order = self._cached_shot_devices
+                else:
+                    with h5py.File(path, 'r') as hdf5_file:
+                        devices_in_use = {}
+                        start_order = {}
+                        stop_order = {}
+                        for name in  hdf5_file['devices']:
+                            device_properties = labscript_utils.properties.get(
+                                hdf5_file, name, 'device_properties'
+                            )
+                            devices_in_use[name] = self.BLACS.tablist[name]
+                            start_order[name] = device_properties.get('start_order', None)
+                            stop_order[name] = device_properties.get('stop_order', None)
+                    if self.assume_static_shot_devices:
+                        self._cached_shot_devices = (devices_in_use, start_order, stop_order)
 
                 # Sort the devices into groups based on their start_order and stop_order
                 start_groups = defaultdict(set)

@@ -250,6 +250,10 @@ class Tab(object):
         self.event_queue = StateQueue(self.device_name)
         self.workers = {}
         self.worker_classes = [] # used to check existence of 'post_experiment' method in device worers
+        # Cache for whether any worker in worker_classes lacks 'post_experiment' (forcing
+        # the legacy transition_to_manual fallback). None means not yet computed; computed
+        # once on first use instead of every shot, since the check itself is not free.
+        self._post_experiment_old_flow = None
         self._supports_smart_programming = False
         self._restart_receiver = []
         self.shutdown_workers_complete = False
@@ -838,6 +842,12 @@ class Tab(object):
                                         for the new API or a single worker task for the old API.""")
                     while generator_running:
                         try:
+                            # Dispatch the job to every worker first, before waiting on
+                            # any of their start-acks. Previously each worker's ack was
+                            # awaited before the next worker was even sent its job,
+                            # serializing N worker dispatches instead of letting them
+                            # all start concurrently.
+                            dispatched_workers = []
                             for worker_task in worker_tasks:
                                 worker_process,worker_function,worker_args,worker_kwargs = worker_task
                                 logger.debug('Instructing worker %s to do job %s'%(worker_process,worker_function) )
@@ -861,15 +871,17 @@ class Tab(object):
                                 from_worker = workers[worker_process][2]
                                 to_worker.put(worker_arg_list)
                                 self.state = '%s (%s)'%(worker_function,worker_process)
-                                
-                                logger.debug('Waiting for worker to acknowledge job request')
+
+                                dispatched_workers.append((worker_process, from_worker))
+
+                            logger.debug('Waiting for workers to acknowledge job request')
+                            for worker_process, from_worker in dispatched_workers:
                                 success, message, results = from_worker.get()
                                 if not success:
                                     logger.info('Worker reported failure to start job')
                                     raise Exception(message)
-                                logger.debug('Worker reported job started, waiting for completion')
-
                                 active_workers.append((worker_process, from_worker))
+                            logger.debug('All workers reported job started, waiting for completion')
 
                             for worker_process, from_worker in active_workers:
                                 success, message, results = from_worker.get()

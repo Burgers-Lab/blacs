@@ -768,36 +768,38 @@ class DeviceTab(Tab):
 
     @define_state(MODE_BUFFERED,False)
     def post_experiment(self,notify_queue,program=False,skip_manual=False):
-        # Ensure backwards compatibility: fallback to 'transition_to_manual' state 
+        # Ensure backwards compatibility: fallback to 'transition_to_manual' state
         # function if 'post_experiment' is not implemented in device workers.
-        # 
-        # Note: This check adds ~80ms overhead in the processing of the first shot of a
-        # sequence. If you choose to continue using this optimized BLACS flow, it is 
-        # recommended that you implement the post_experiment worker task for all your 
-        # devices and remove the need for this backwards compatibility check
-        old_state_flow = False
-        for worker_class in self.worker_classes:
-            exists = True
-            # If the worker_class is a string, it is an import path
-            if isinstance(worker_class, str):
-                res = worker_class.rsplit('.', 1)
-                module = importlib.import_module(res[0])
-                worker_class_import = getattr(module, res[1])
-                exists = hasattr(worker_class_import, 'post_experiment')
-            else:
-                exists = hasattr(worker_class, 'post_experiment')
+        #
+        # This check involves importlib/hasattr inspection, which is not free, so it is
+        # only performed once per Tab (cached in self._post_experiment_old_flow) rather
+        # than on every shot.
+        if self._post_experiment_old_flow is None:
+            old_state_flow = False
+            for worker_class in self.worker_classes:
+                exists = True
+                # If the worker_class is a string, it is an import path
+                if isinstance(worker_class, str):
+                    res = worker_class.rsplit('.', 1)
+                    module = importlib.import_module(res[0])
+                    worker_class_import = getattr(module, res[1])
+                    exists = hasattr(worker_class_import, 'post_experiment')
+                else:
+                    exists = hasattr(worker_class, 'post_experiment')
 
-            if not exists:
-                self.logger.debug(f"all workers: {self.worker_classes}")
-                msg = (
-                    f"Workers for device '{self.device_name}' do not have an implementation for the newly added "
-                    "`post_experiment` state. Reverting to `transition_to_manual` as per the original labscript state "
-                    "machine flow. Consider adding an implementation for `post_experiment` for improved performance."
-                )
-                warnings.warn(dedent(msg), RuntimeWarning)
-                old_state_flow = True
-                break
-        if old_state_flow:
+                if not exists:
+                    self.logger.debug(f"all workers: {self.worker_classes}")
+                    msg = (
+                        f"Workers for device '{self.device_name}' do not have an implementation for the newly added "
+                        "`post_experiment` state. Reverting to `transition_to_manual` as per the original labscript state "
+                        "machine flow. Consider adding an implementation for `post_experiment` for improved performance."
+                    )
+                    warnings.warn(dedent(msg), RuntimeWarning)
+                    old_state_flow = True
+                    break
+            self._post_experiment_old_flow = old_state_flow
+
+        if self._post_experiment_old_flow:
             self.transition_to_manual(notify_queue, program)
             yield None
             return
