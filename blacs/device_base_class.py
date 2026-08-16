@@ -809,25 +809,39 @@ class DeviceTab(Tab):
         tasks.append(self.queue_work(self._primary_worker,'post_experiment'))
         for worker in self._secondary_workers:
             tasks.append(self.queue_work(worker,'post_experiment'))
-        
+
+        _perf_rpc_start = time.time()
         raw_results = yield(tasks, False)
+        self.logger.info(
+            'PERF %s post_experiment RPC round-trip took %.4fs'
+            % (self.device_name, time.time() - _perf_rpc_start)
+        )
         success = all(raw_results)
 
         self.mode = MODE_POST_EXP
         
         if success:
             if skip_manual:
-                # Update the channel with the final values of the run, but no need to 
-                # grab the QTlock and update the GUI.
-                for channel, value in self._final_values.items():
-                    if channel in self._AO:
-                        self._AO[channel].set_value(value,program=False,update_gui=True)
-                    elif channel in self._DO:
-                        self._DO[channel].set_value(value,program=False,update_gui=True)
-                    elif channel in self._image:
-                        self._image[channel].set_value(value,program=False,update_gui=True)
-                    elif channel in self._DDS:
-                        self._DDS[channel].set_value(value,program=False,update_gui=True)
+                # Update the channels with the final values of the run. Each
+                # set_value() call below grabs qtlock internally, and qtlock is a
+                # cross-thread lock that blocks until the Qt mainloop acknowledges
+                # it (see qtutils.locking.QtLock) -- expensive on first acquisition,
+                # but cheap (just a re-entrant counter) on subsequent nested
+                # acquisitions from the same thread. Grabbing it once here up front,
+                # like transition_to_manual does below, means only the first
+                # channel pays that cost instead of every channel in this device
+                # paying it separately -- this was previously costing ~1
+                # Qt-mainloop round-trip per DO/AO channel, every single shot.
+                with qtlock:
+                    for channel, value in self._final_values.items():
+                        if channel in self._AO:
+                            self._AO[channel].set_value(value,program=False,update_gui=True)
+                        elif channel in self._DO:
+                            self._DO[channel].set_value(value,program=False,update_gui=True)
+                        elif channel in self._image:
+                            self._image[channel].set_value(value,program=False,update_gui=True)
+                        elif channel in self._DDS:
+                            self._DDS[channel].set_value(value,program=False,update_gui=True)
 
                 # Do not transition_to_manual, continue state machine flow from
                 # the MODE_POST_EXP state

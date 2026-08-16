@@ -913,10 +913,16 @@ class QueueManager(object):
                 #                                                             SCIENCE!                                                                   #
                 ##########################################################################################################################################
             
+                # PERF: time spent reading device groups + transition_to_buffered
+                # across all devices for this shot.
+                logger.info(
+                    'PERF transition_to_buffered phase took %.4fs' % (time.time() - start_time)
+                )
+
                 # Get front panel data, but don't save it to the h5 file until the experiment ends:
                 states,tab_positions,window_data,plugin_data = self.BLACS.front_panel_settings.get_save_data()
                 # self.set_status("Running (program time: %.3fs)..."%(time.time() - start_time), path)
-                    
+
                 # A Queue for event-based notification of when the experiment has finished.
                 experiment_finished_queue = queue.Queue()
                 logger.debug('About to start the master pseudoclock')
@@ -924,12 +930,21 @@ class QueueManager(object):
 
                 ##########################################################################################################################################
                 #                                                        Plugin callbacks                                                                #
-                ########################################################################################################################################## 
+                ##########################################################################################################################################
                 for callback in plugins.get_callbacks('science_starting'):
                     try:
                         callback(path)
                     except Exception:
                         logger.exception("Plugin callback raised an exception")
+
+                # PERF: full shot-to-shot gap, from the previous shot's "Run complete"
+                # to this shot's start_run() call, i.e. what the oscilloscope sees
+                # between the last pulse of shot N and the first pulse of shot N+1.
+                if hasattr(self, '_perf_shot_end_time'):
+                    logger.info(
+                        'PERF total shot-to-shot gap: %.4fs'
+                        % (time.time() - self._perf_shot_end_time)
+                    )
 
                 #TODO: fix potential race condition if BLACS is closing when this line executes?
                 self.BLACS.tablist[self.master_pseudoclock].start_run(experiment_finished_queue)
@@ -981,6 +996,9 @@ class QueueManager(object):
                     continue                
                 
                 logger.info('Run complete')
+                # PERF: mark the end of this shot so we can measure the full
+                # shot-to-shot gap once the next shot's start_run() is reached.
+                self._perf_shot_end_time = time.time()
                 # self.set_status("Saving data...", path)
             # End try/except block here
             except Exception:
@@ -1043,13 +1061,17 @@ class QueueManager(object):
             ##########################################################################################################################################
             # start new try/except block here                   
             try:
+                _perf_h5_start = time.time()
                 with h5py.File(path,'r+') as hdf5_file:
                     self.BLACS.front_panel_settings.store_front_panel_in_h5(hdf5_file,states,tab_positions,window_data,plugin_data,save_conn_table=False, save_queue_data=False)
 
                     data_group = hdf5_file['/'].create_group('data')
                     # stamp with the run time of the experiment
                     hdf5_file.attrs['run time'] = run_time.strftime('%Y%m%dT%H%M%S.%f')
-                
+                logger.info(
+                    'PERF store_front_panel_in_h5 (h5 write) took %.4fs' % (time.time() - _perf_h5_start)
+                )
+
                 # Check if there is another file in the queue already, or if "Repeat"
                 # is enabled (in which case this same shot will be resubmitted by the
                 # "Repeat Experiment?" block near the end of this loop -- but that
@@ -1081,8 +1103,9 @@ class QueueManager(object):
                 # Keep executing post_experiment state of each tab and waiting on them until
                 # they are all done or have all errored/restarted/failed. If one fails, we
                 # still have to transition the rest to manual mode:
-                # After the post_experiment state has been executed, implicitly transition to 
-                # manual below if necessary 
+                # After the post_experiment state has been executed, implicitly transition to
+                # manual below if necessary
+                _perf_stop_groups_start = time.time()
                 while stop_groups:
                     transition_list = {}
                     # Transition the next group to manual mode:
@@ -1129,8 +1152,13 @@ class QueueManager(object):
                         tab = devices_in_use[name]
                         inmain(tab.disconnect_restart_receiver, restart_function)
                         del transition_list[name]
-                    
-                if error_condition:                
+
+                logger.info(
+                    'PERF stop_groups loop (per-device post_experiment RPCs) took %.4fs'
+                    % (time.time() - _perf_stop_groups_start)
+                )
+
+                if error_condition:
                     self.set_status("Error in transtion to manual\nQueue Paused")
                                        
             except Exception:
@@ -1164,10 +1192,18 @@ class QueueManager(object):
                 
                 continue
             
+            # PERF: time from run-complete to all devices finishing post_experiment
+            # (skip_manual path) or transition_to_manual (non-skip path).
+            if hasattr(self, '_perf_shot_end_time'):
+                logger.info(
+                    'PERF post_experiment/transition_to_manual phase took %.4fs'
+                    % (time.time() - self._perf_shot_end_time)
+                )
+
             ##########################################################################################################################################
             #                                                        Analysis Submission                                                             #
-            ########################################################################################################################################## 
-            logger.info('All devices are back in static mode.')  
+            ##########################################################################################################################################
+            logger.info('All devices are back in static mode.')
 
             # check for analysis Filters in Plugins
             send_to_analysis = True
@@ -1209,11 +1245,16 @@ class QueueManager(object):
                 if ((self.manager_repeat_mode == self.REPEAT_ALL) or
                     (self.manager_repeat_mode == self.REPEAT_LAST and inmain(self._model.rowCount) == 0)):
                     # Resubmit job to the bottom of the queue:
+                    _perf_repeat_start = time.time()
                     try:
                         message = self.process_request(path, skip_connection_check=True)
                     except Exception:
                         # TODO: make this error popup for the user
                         self._logger.exception('Failed to copy h5_file (%s) for repeat run'%s)
+                    logger.info(
+                        'PERF repeat resubmission (process_request) took %.4fs'
+                        % (time.time() - _perf_repeat_start)
+                    )
                     logger.info(message)      
 
             # self.set_status("Idle")
