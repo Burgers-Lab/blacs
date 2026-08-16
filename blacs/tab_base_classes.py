@@ -19,6 +19,7 @@ import logging
 import warnings
 import queue
 import pickle
+import inspect
 from html import escape
 import os
 from types import GeneratorType
@@ -966,11 +967,30 @@ class Worker(Process):
                 setattr(self, name, value)
         self.mainloop()
 
-    def _transition_to_buffered(self, device_name, h5_file, front_panel_values, fresh):
+    def _transition_to_buffered(self, device_name, h5_file, front_panel_values, fresh, groups=None):
         # The h5_file arg was converted to network-agnostic before being sent to us.
         # Convert it to a local path before calling the subclass's
         # transition_to_buffered() method
         h5_file = path_to_local(h5_file)
+        # Only forward `groups` to subclasses whose transition_to_buffered actually
+        # accepts it -- older/third-party device implementations that only take the
+        # original 4 arguments must keep working unchanged. This is checked once per
+        # worker process (there's only one transition_to_buffered per worker) and
+        # cached, since inspecting a signature on every shot would defeat some of the
+        # point of avoiding per-shot overhead.
+        if not hasattr(self, '_transition_to_buffered_accepts_groups'):
+            try:
+                params = inspect.signature(self.transition_to_buffered).parameters
+                self._transition_to_buffered_accepts_groups = (
+                    'groups' in params
+                    or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                )
+            except (TypeError, ValueError):
+                self._transition_to_buffered_accepts_groups = False
+        if self._transition_to_buffered_accepts_groups:
+            return self.transition_to_buffered(
+                device_name, h5_file, front_panel_values, fresh, groups=groups
+            )
         return self.transition_to_buffered(
             device_name, h5_file, front_panel_values, fresh
         )

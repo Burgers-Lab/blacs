@@ -652,26 +652,26 @@ class DeviceTab(Tab):
         raise NotImplementedError('The device %s has not implemented a start method and so cannot be used to trigger the experiment to begin. Please implement the start method or use a different pseudoclock as the master pseudoclock'%self.device_name)
     
     @define_state(MODE_MANUAL|MODE_POST_EXP,True)
-    def transition_to_buffered(self,h5_file,notify_queue): 
+    def transition_to_buffered(self,h5_file,notify_queue,groups=None):
         # Get rid of any "remote values changed" dialog
         if self._changed_widget_set:
             with qtlock:
                 self._changed_widget.hide()
                 self._changed_widget_set = False
-    
+
         self.mode = MODE_TRANSITION_TO_BUFFERED
-        
+
         h5_file = path_to_agnostic(h5_file)
         # transition_to_buffered returns the final values of the run, to update the GUI with at the end of the run:
         transitioned_called = [self._primary_worker]
         front_panel_values = self.get_front_panel_values()
-        
+
         tasks = []
-        
-        tasks.append(self.queue_work(self._primary_worker,'_transition_to_buffered',self.device_name,h5_file,front_panel_values,self._force_full_buffered_reprogram))
+
+        tasks.append(self.queue_work(self._primary_worker,'_transition_to_buffered',self.device_name,h5_file,front_panel_values,self._force_full_buffered_reprogram,groups))
         for worker in self._secondary_workers:
             transitioned_called.append(worker)
-            tasks.append(self.queue_work(worker,'_transition_to_buffered',self.device_name,h5_file,front_panel_values,self.force_full_buffered_reprogram))
+            tasks.append(self.queue_work(worker,'_transition_to_buffered',self.device_name,h5_file,front_panel_values,self.force_full_buffered_reprogram,groups))
         raw_results = yield(tasks, True)
         res = {}
         for res in raw_results:

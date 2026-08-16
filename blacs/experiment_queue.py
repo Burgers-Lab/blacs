@@ -131,6 +131,20 @@ class QueueManager(object):
         self.assume_static_shot_devices = False
         self._cached_shot_devices = None
 
+        # Opt-in optimization: when True, read each device's own h5 group (its
+        # output/acquisition table etc.) once here and hand it directly to that
+        # device's transition_to_buffered, instead of leaving every device worker to
+        # independently open and re-parse the same shot h5 file. This data is
+        # per-shot (unlike assume_static_shot_devices above) and is therefore always
+        # read fresh, never cached, regardless of that flag. Off by default: for very
+        # large per-shot tables, pickling/IPC-transferring the data to the worker
+        # process could plausibly cost more than the worker just reading it locally,
+        # so this is worth measuring on your own hardware before enabling. Devices
+        # whose transition_to_buffered doesn't accept a `groups` argument are
+        # detected automatically and just don't receive it (see
+        # Worker._transition_to_buffered in tab_base_classes.py).
+        self.pipeline_h5_groups_to_workers = False
+
         # Create listview model
         self._model = QStandardItemModel()
         self._create_headers()
@@ -509,12 +523,28 @@ class QueueManager(object):
     def has_next_file(self):
         return self._model.rowCount() > 0
       
-    def transition_device_to_buffered(self, name, transition_list, h5file, restart_receiver):
+    @staticmethod
+    def _extract_device_group(hdf5_file, device_name, device_properties):
+        """Read a device's own h5 group into a plain, picklable dict of numpy arrays
+        (recursing one level into any sub-groups), so its transition_to_buffered can
+        be handed the data directly instead of independently opening and re-parsing
+        the same shot h5 file."""
+        group = hdf5_file['devices'][device_name]
+        extracted = {}
+        for key, item in group.items():
+            if isinstance(item, h5py.Group):
+                extracted[key] = {k: v[:] for k, v in item.items()}
+            else:
+                extracted[key] = item[:]
+        extracted['__device_properties__'] = device_properties
+        return extracted
+
+    def transition_device_to_buffered(self, name, transition_list, h5file, restart_receiver, groups=None):
         tab = self.BLACS.tablist[name]
         if self.get_device_error_state(name,self.BLACS.tablist):
             return False
         tab.connect_restart_receiver(restart_receiver)
-        tab.transition_to_buffered(h5file,self.current_queue)
+        tab.transition_to_buffered(h5file,self.current_queue,groups)
         transition_list[name] = tab
         return True
     
@@ -683,22 +713,70 @@ class QueueManager(object):
                 # enabled, reuse the result from the previous shot in this run instead
                 # of re-reading it (the cache is invalidated whenever the queue goes
                 # idle, so a fresh run always re-verifies on its first shot).
-                if self.assume_static_shot_devices and self._cached_shot_devices is not None:
+                #
+                # If pipeline_h5_groups_to_workers is also enabled, each device's own
+                # h5 group is read here too and handed straight to that device's
+                # transition_to_buffered (see device_groups below). That data is
+                # per-shot, so it's always read fresh here regardless of whether the
+                # devices_in_use/start_order/stop_order read above was skipped via
+                # the cache.
+                device_groups = {}
+                have_cached_devices = (
+                    self.assume_static_shot_devices
+                    and self._cached_shot_devices is not None
+                )
+                need_h5_open = not have_cached_devices or self.pipeline_h5_groups_to_workers
+
+                if not need_h5_open:
                     devices_in_use, start_order, stop_order = self._cached_shot_devices
                 else:
                     with h5py.File(path, 'r') as hdf5_file:
-                        devices_in_use = {}
-                        start_order = {}
-                        stop_order = {}
-                        for name in  hdf5_file['devices']:
-                            device_properties = labscript_utils.properties.get(
-                                hdf5_file, name, 'device_properties'
-                            )
-                            devices_in_use[name] = self.BLACS.tablist[name]
-                            start_order[name] = device_properties.get('start_order', None)
-                            stop_order[name] = device_properties.get('stop_order', None)
-                    if self.assume_static_shot_devices:
-                        self._cached_shot_devices = (devices_in_use, start_order, stop_order)
+                        if have_cached_devices:
+                            devices_in_use, start_order, stop_order = self._cached_shot_devices
+                            device_names = list(devices_in_use)
+                        else:
+                            devices_in_use = {}
+                            start_order = {}
+                            stop_order = {}
+                            device_names = list(hdf5_file['devices'])
+                            for name in device_names:
+                                device_properties = labscript_utils.properties.get(
+                                    hdf5_file, name, 'device_properties'
+                                )
+                                devices_in_use[name] = self.BLACS.tablist[name]
+                                start_order[name] = device_properties.get('start_order', None)
+                                stop_order[name] = device_properties.get('stop_order', None)
+                                if self.pipeline_h5_groups_to_workers:
+                                    device_groups[name] = self._extract_device_group(
+                                        hdf5_file, name, device_properties
+                                    )
+                            if self.assume_static_shot_devices:
+                                self._cached_shot_devices = (devices_in_use, start_order, stop_order)
+
+                        if self.pipeline_h5_groups_to_workers and have_cached_devices:
+                            # The loop above didn't run (devices_in_use came from
+                            # cache), so extract this shot's per-device group data
+                            # in its own pass here instead.
+                            for name in device_names:
+                                device_properties = labscript_utils.properties.get(
+                                    hdf5_file, name, 'device_properties'
+                                )
+                                device_groups[name] = self._extract_device_group(
+                                    hdf5_file, name, device_properties
+                                )
+
+                        if self.pipeline_h5_groups_to_workers and 'waits' in hdf5_file:
+                            # The wait table is global, not per-device, but multiple
+                            # devices (wait monitor, pseudoclock) each independently
+                            # read it in their own transition_to_buffered. Read it
+                            # once here and attach it to every device's group dict.
+                            waits_dataset = hdf5_file['waits']
+                            shared_waits = {
+                                'data': waits_dataset[:],
+                                'attrs': dict(waits_dataset.attrs),
+                            }
+                            for group in device_groups.values():
+                                group['__waits__'] = shared_waits
 
                 # Sort the devices into groups based on their start_order and stop_order
                 start_groups = defaultdict(set)
@@ -713,7 +791,7 @@ class QueueManager(object):
                         for name in start_groups.pop(min(start_groups)):
                             try:
                                 # Connect restart signal from tabs to current_queue and transition the device to buffered mode
-                                success = self.transition_device_to_buffered(name,transition_list,path,restart_function)
+                                success = self.transition_device_to_buffered(name,transition_list,path,restart_function,device_groups.get(name))
                                 if not success:
                                     logger.error('%s has an error condition, aborting run' % name)
                                     error_condition = True
@@ -952,10 +1030,29 @@ class QueueManager(object):
                     # stamp with the run time of the experiment
                     hdf5_file.attrs['run time'] = run_time.strftime('%Y%m%dT%H%M%S.%f')
                 
-                # check if there is another file in the queue already
+                # Check if there is another file in the queue already, or if "Repeat"
+                # is enabled (in which case this same shot will be resubmitted by the
+                # "Repeat Experiment?" block near the end of this loop -- but that
+                # happens well after this point, so has_next_file() alone can't see
+                # it yet). Without the manager_repeat check, every shot run under
+                # "Repeat" was unconditionally taking the slow skip_manual=False path
+                # -- including the full transition_to_manual on every single shot,
+                # e.g. NI_DAQmxOutputWorker recreating and restarting its DAQmx tasks
+                # from scratch every time -- even though from the user's perspective
+                # it's a continuously running queue.
+                #
+                # This is a prediction, not a guarantee: it doesn't run any
+                # shot_ignore_repeat plugin callbacks (which may depend on final shot
+                # data not yet available here) or re-check queue emptiness (which can
+                # change if shots are also being submitted externally). If the
+                # prediction turns out wrong and nothing actually gets requeued,
+                # affected device tabs simply stay in MODE_POST_EXP until the queue
+                # is paused or a new shot is submitted -- both return them to manual
+                # mode -- so an occasional wrong guess here is a minor, recoverable
+                # inconvenience, not a correctness problem.
                 queued_experiments = True
                 try:
-                    queued_experiments = self.has_next_file()
+                    queued_experiments = self.has_next_file() or self.manager_repeat
                 except Exception:
                     pass
 
