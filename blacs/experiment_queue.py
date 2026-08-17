@@ -1061,6 +1061,18 @@ class QueueManager(object):
             ##########################################################################################################################################
             # start new try/except block here                   
             try:
+                # NOTE: previously tried deferring store_front_panel_in_h5 (below)
+                # to a background thread here, on the theory that nothing about
+                # starting the next shot depends on it finishing. Measured result
+                # was a regression (~190-200ms/shot -> ~250ms/shot), not an
+                # improvement: the background thread's Python-level work (numpy
+                # array construction, h5py/zlock calls) contends for the GIL with
+                # the queue_manager thread and each device Tab's own dispatch
+                # thread, which are on the actual latency-sensitive critical path.
+                # Threading only helps here if the backgrounded work is
+                # GIL-releasing I/O wait the whole time, which this isn't. Do not
+                # re-attempt this without switching to a separate process instead
+                # of a thread (with its own IPC overhead to weigh against the gain).
                 _perf_h5_start = time.time()
                 with h5py.File(path,'r+') as hdf5_file:
                     self.BLACS.front_panel_settings.store_front_panel_in_h5(hdf5_file,states,tab_positions,window_data,plugin_data,save_conn_table=False, save_queue_data=False)
@@ -1105,6 +1117,19 @@ class QueueManager(object):
                 # still have to transition the rest to manual mode:
                 # After the post_experiment state has been executed, implicitly transition to
                 # manual below if necessary
+                # inmain() is a blocking round-trip through the Qt event loop (post
+                # an event, wait for the Qt mainloop to process it), same cost
+                # category as qtlock, but with no "already held" fast path -- every
+                # call pays the full round-trip. This used to be called once per
+                # device, sequentially, right as each device's response arrived, so
+                # N devices meant N serialized round-trips even though the RPC
+                # dispatches themselves were concurrent. Batching all of a group's
+                # disconnects into a single inmain() call (below) turns that into
+                # one round-trip per stop_order group instead of one per device.
+                def _disconnect_restart_receivers(tabs, function):
+                    for tab in tabs:
+                        tab.disconnect_restart_receiver(function)
+
                 _perf_stop_groups_start = time.time()
                 while stop_groups:
                     transition_list = {}
@@ -1117,6 +1142,7 @@ class QueueManager(object):
                         except Exception:
                             logger.exception('Exception while transitioning %s to manual mode.'%(name))
                             error_condition = True
+                    tabs_to_disconnect = []
                     # Wait for their responses:
                     while transition_list:
                         logger.info('Waiting for the following devices to finish transitioning to manual mode: %s'%str(transition_list))
@@ -1147,11 +1173,14 @@ class QueueManager(object):
                             logger.debug('%s is in an error state' % name)
                         else:
                             logger.debug('%s finished transitioning to manual mode' % name)
-                        # Once device has transitioned_to_manual, disconnect restart
-                        # signal:
-                        tab = devices_in_use[name]
-                        inmain(tab.disconnect_restart_receiver, restart_function)
+                        # Once device has transitioned_to_manual, queue it up to have
+                        # its restart signal disconnected (see _disconnect_restart_receivers
+                        # above for why this is batched instead of done here inline):
+                        tabs_to_disconnect.append(devices_in_use[name])
                         del transition_list[name]
+
+                    if tabs_to_disconnect:
+                        inmain(_disconnect_restart_receivers, tabs_to_disconnect, restart_function)
 
                 logger.info(
                     'PERF stop_groups loop (per-device post_experiment RPCs) took %.4fs'

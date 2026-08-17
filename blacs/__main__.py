@@ -29,6 +29,16 @@ splash.show()
 splash.update_text('importing standard library modules')
 import subprocess
 import sys
+
+# PERF NOTE: tried sys.setswitchinterval(0.001) here (default is 0.005) on the
+# theory that BLACS's one-dispatch-thread-per-device-Tab model was suffering
+# GIL-wait latency that grows with device count. Measured result was a
+# regression (avg total shot-to-shot gap went from ~221ms to ~302ms with 4
+# devices) -- more frequent GIL handoffs apparently cost more in per-switch
+# overhead than they saved in wait latency for this workload. Do not
+# re-attempt shortening the interval without new evidence; if this angle is
+# revisited, try lengthening it instead (untested) before assuming the whole
+# approach is a dead end.
 import time
 from pathlib import Path
 import platform
@@ -36,6 +46,35 @@ WINDOWS = platform.system() == 'Windows'
 
 # No splash update for Qt - the splash code has already imported it:
 import qtutils
+
+# PERF: `import qtutils` calls qtlock.enforce() as a side effect, which
+# installs a threading.setprofile() hook that fires on every function
+# call/return event in every thread started afterwards (queue_manager
+# thread, every device Tab's mainloop thread, etc.) -- not just Qt calls,
+# everything. Its purpose is to catch a real bug class: touching Qt objects
+# from a non-GUI thread without holding qtlock, which can crash or corrupt
+# Qt's C++ internals -- normally it would raise loudly the moment that
+# happens, rather than failing silently/intermittently.
+#
+# A py-spy profile of a live queued run (4 devices: PrawnBlaster + 2x
+# NI_DAQmx + BurgersSmallDDS) showed samples landing inside this hook's
+# `enforce` frame ~8-10% of the time across all threads. It was the main
+# driver of a scaling problem where the shot-to-shot gap grew substantially
+# with device count (~200ms at 2 devices, ~220-280ms at 4) even though each
+# device's own worker-side processing time was unchanged. Disabling it
+# brought the 4-device gap down to ~190ms -- at or below the 2-device
+# baseline -- confirmed via BLACS.log timing across multiple runs, no
+# errors/exceptions.
+#
+# This is a deliberate, permanent trade: we are giving up the loud
+# exception-on-violation safety net for Qt-thread-safety bugs (in BLACS
+# itself and in any labscript_devices worker code it loads) in exchange for
+# this scaling fix. If BLACS ever starts exhibiting rare/hard-to-reproduce
+# GUI crashes or corruption, re-enabling this (delete this call, or call
+# qtutils.qtlock.enforce(True)) to help diagnose whether a Qt-thread-safety
+# violation is the cause should be an early step.
+qtutils.qtlock.enforce(False)
+
 from qtutils import *
 import qtutils.icons
 from qtutils.qt.QtCore import *
